@@ -27,6 +27,7 @@ const MAX_SEARCH_COUNT = 10;
 
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
 const PERPLEXITY_SEARCH_ENDPOINT = "https://api.perplexity.ai/search";
+const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
 
 const XAI_API_ENDPOINT = "https://api.x.ai/v1/responses";
 const DEFAULT_GROK_MODEL = "grok-4-1-fast";
@@ -249,9 +250,11 @@ type BraveSearchResponse = {
 
 type PerplexityConfig = {
   apiKey?: string;
+  baseUrl?: string;
+  model?: string;
 };
 
-type PerplexityApiKeySource = "config" | "perplexity_env" | "none";
+type PerplexityApiKeySource = "config" | "perplexity_env" | "openrouter_env" | "none";
 
 type GrokConfig = {
   apiKey?: string;
@@ -575,7 +578,28 @@ function resolvePerplexityApiKey(perplexity?: PerplexityConfig): {
     return { apiKey: fromEnvPerplexity, source: "perplexity_env" };
   }
 
+  const fromEnvOpenRouter = normalizeApiKey(process.env.OPENROUTER_API_KEY);
+  if (fromEnvOpenRouter) {
+    return { apiKey: fromEnvOpenRouter, source: "openrouter_env" };
+  }
+
   return { apiKey: undefined, source: "none" };
+}
+
+function resolvePerplexityBaseUrl(perplexity?: PerplexityConfig): string | undefined {
+  const fromConfig =
+    perplexity && "baseUrl" in perplexity && typeof perplexity.baseUrl === "string"
+      ? perplexity.baseUrl.trim()
+      : "";
+  return fromConfig || undefined;
+}
+
+function resolvePerplexityModel(perplexity?: PerplexityConfig): string {
+  const fromConfig =
+    perplexity && "model" in perplexity && typeof perplexity.model === "string"
+      ? perplexity.model.trim()
+      : "";
+  return fromConfig || "perplexity/sonar-pro";
 }
 
 function normalizeApiKey(key: unknown): string {
@@ -919,11 +943,256 @@ async function throwWebSearchApiError(res: Response, providerLabel: string): Pro
   throw new Error(`${providerLabel} API error (${res.status}): ${detail || res.statusText}`);
 }
 
+function extractOpenRouterAssistantText(data: {
+  choices?: Array<{
+    message?: {
+      content?: string | Array<{ text?: string } | string>;
+    };
+  }>;
+}): string {
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((part) => {
+      if (typeof part === "string") {
+        return part;
+      }
+      return typeof part?.text === "string" ? part.text : "";
+    })
+    .join("")
+    .trim();
+}
+
+function stripOpenRouterCitationMarkers(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/, "")
+    .replace(/}\s*\[(\d+(?:\s*,\s*\d+)*)\](?=\s*,)/g, "}")
+    .replace(/]\s*\[(\d+(?:\s*,\s*\d+)*)\](?=\s*[},])/g, "]")
+    .replace(/"\s*\[(\d+(?:\s*,\s*\d+)*)\](?=\s*[,}])/g, '"');
+}
+
+function extractOpenRouterUrlCitations(data: {
+  choices?: Array<{
+    message?: {
+      annotations?: Array<{
+        url_citation?: { url?: string; title?: string };
+      }>;
+    };
+  }>;
+}): Array<{ title?: string; url: string }> {
+  const annotations = data.choices?.[0]?.message?.annotations;
+  if (!Array.isArray(annotations)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const results: Array<{ title?: string; url: string }> = [];
+  for (const annotation of annotations) {
+    const citation = annotation?.url_citation;
+    const url = typeof citation?.url === "string" ? citation.url.trim() : "";
+    if (!url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    results.push({
+      title: typeof citation?.title === "string" ? citation.title.trim() : undefined,
+      url,
+    });
+  }
+  return results;
+}
+
+function normalizeOpenRouterSearchResults(
+  payload: unknown,
+  citations: Array<{ title?: string; url: string }>,
+  maxCount: number,
+): Array<{
+  title: string;
+  url: string;
+  description: string;
+  published?: string;
+  siteName?: string;
+}> {
+  const rawResults = Array.isArray((payload as { results?: unknown[] })?.results)
+    ? ((payload as { results: unknown[] }).results ?? [])
+    : Array.isArray(payload)
+      ? payload
+      : [];
+  const normalized: Array<{
+    title: string;
+    url: string;
+    description: string;
+    published?: string;
+    siteName?: string;
+  }> = [];
+  const seen = new Set<string>();
+  for (const entry of rawResults) {
+    const url =
+      typeof (entry as { url?: unknown })?.url === "string"
+        ? String((entry as { url: string }).url).trim()
+        : "";
+    if (!url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    const title =
+      typeof (entry as { title?: unknown })?.title === "string"
+        ? String((entry as { title: string }).title)
+        : "";
+    const description =
+      typeof (entry as { description?: unknown })?.description === "string"
+        ? String((entry as { description: string }).description)
+        : typeof (entry as { snippet?: unknown })?.snippet === "string"
+          ? String((entry as { snippet: string }).snippet)
+          : "";
+    const published =
+      typeof (entry as { published?: unknown })?.published === "string"
+        ? String((entry as { published: string }).published)
+        : typeof (entry as { date?: unknown })?.date === "string"
+          ? String((entry as { date: string }).date)
+          : undefined;
+    normalized.push({
+      title: title ? wrapWebContent(title, "web_search") : "",
+      url,
+      description: description ? wrapWebContent(description, "web_search") : "",
+      published,
+      siteName: resolveSiteName(url) || undefined,
+    });
+  }
+  if (normalized.length > 0) {
+    return normalized.slice(0, maxCount);
+  }
+  for (const citation of citations) {
+    if (!citation.url || seen.has(citation.url)) {
+      continue;
+    }
+    seen.add(citation.url);
+    normalized.push({
+      title: citation.title ? wrapWebContent(citation.title, "web_search") : "",
+      url: citation.url,
+      description: "",
+      published: undefined,
+      siteName: resolveSiteName(citation.url) || undefined,
+    });
+  }
+  return normalized.slice(0, maxCount);
+}
+
+async function runOpenRouterPerplexitySearch(params: {
+  query: string;
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  count: number;
+  timeoutSeconds: number;
+  country?: string;
+  searchDomainFilter?: string[];
+  searchRecencyFilter?: string;
+  searchLanguageFilter?: string[];
+  searchAfterDate?: string;
+  searchBeforeDate?: string;
+  maxTokens?: number;
+}): Promise<
+  Array<{ title: string; url: string; description: string; published?: string; siteName?: string }>
+> {
+  const baseUrl = params.baseUrl.replace(/\/+$/, "") || OPENROUTER_API_BASE;
+  const constraints = [
+    'Return JSON only with shape {"results":[{"title":"string","url":"https://...","description":"string"}]}.',
+    `Find up to ${params.count} web results for the query.`,
+  ];
+  if (params.country) {
+    constraints.push(`Prefer results relevant to country ${params.country}.`);
+  }
+  if (params.searchDomainFilter && params.searchDomainFilter.length > 0) {
+    constraints.push(`Domain filter: ${params.searchDomainFilter.join(", ")}.`);
+  }
+  if (params.searchRecencyFilter) {
+    constraints.push(`Freshness: ${params.searchRecencyFilter}.`);
+  }
+  if (params.searchLanguageFilter && params.searchLanguageFilter.length > 0) {
+    constraints.push(`Preferred language(s): ${params.searchLanguageFilter.join(", ")}.`);
+  }
+  if (params.searchAfterDate || params.searchBeforeDate) {
+    constraints.push(
+      `Date window: after ${params.searchAfterDate || "any"}; before ${params.searchBeforeDate || "any"}.`,
+    );
+  }
+  if (params.maxTokens !== undefined) {
+    constraints.push(`Keep the full answer under about ${params.maxTokens} tokens.`);
+  }
+
+  return withTrustedWebSearchEndpoint(
+    {
+      url: `${baseUrl}/chat/completions`,
+      timeoutSeconds: params.timeoutSeconds,
+      init: {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Bearer ${params.apiKey}`,
+          "HTTP-Referer": "https://openclaw.ai",
+          "X-Title": "OpenClaw Web Search",
+        },
+        body: JSON.stringify({
+          model: params.model,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You turn live web-search responses into clean structured JSON results. Respond with JSON only.",
+            },
+            {
+              role: "user",
+              content: `${constraints.join(" ")} Query: ${params.query}`,
+            },
+          ],
+          temperature: 0,
+        }),
+      },
+    },
+    async (res) => {
+      if (!res.ok) {
+        return await throwWebSearchApiError(res, "OpenRouter Perplexity Search");
+      }
+      const data = (await res.json()) as {
+        choices?: Array<{
+          message?: {
+            content?: string | Array<{ text?: string } | string>;
+            annotations?: Array<{ url_citation?: { url?: string; title?: string } }>;
+          };
+        }>;
+      };
+      const rawText = extractOpenRouterAssistantText(data);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(stripOpenRouterCitationMarkers(rawText));
+      } catch {
+        parsed = undefined;
+      }
+      return normalizeOpenRouterSearchResults(
+        parsed,
+        extractOpenRouterUrlCitations(data),
+        params.count,
+      );
+    },
+  );
+}
+
 async function runPerplexitySearchApi(params: {
   query: string;
   apiKey: string;
   count: number;
   timeoutSeconds: number;
+  baseUrl?: string;
+  model?: string;
   country?: string;
   searchDomainFilter?: string[];
   searchRecencyFilter?: string;
@@ -965,9 +1234,30 @@ async function runPerplexitySearchApi(params: {
     body.max_tokens_per_page = params.maxTokensPerPage;
   }
 
+  const normalizedBaseUrl = params.baseUrl?.trim();
+  if (normalizedBaseUrl && /openrouter\.ai/i.test(normalizedBaseUrl)) {
+    return runOpenRouterPerplexitySearch({
+      query: params.query,
+      apiKey: params.apiKey,
+      model: params.model || "perplexity/sonar-pro",
+      baseUrl: normalizedBaseUrl,
+      count: params.count,
+      timeoutSeconds: params.timeoutSeconds,
+      country: params.country,
+      searchDomainFilter: params.searchDomainFilter,
+      searchRecencyFilter: params.searchRecencyFilter,
+      searchLanguageFilter: params.searchLanguageFilter,
+      searchAfterDate: params.searchAfterDate,
+      searchBeforeDate: params.searchBeforeDate,
+      maxTokens: params.maxTokens,
+    });
+  }
+
   return withTrustedWebSearchEndpoint(
     {
-      url: PERPLEXITY_SEARCH_ENDPOINT,
+      url: normalizedBaseUrl
+        ? `${normalizedBaseUrl.replace(/\/+$/, "")}/search`
+        : PERPLEXITY_SEARCH_ENDPOINT,
       timeoutSeconds: params.timeoutSeconds,
       init: {
         method: "POST",
@@ -1230,6 +1520,8 @@ async function runWebSearch(params: {
   searchDomainFilter?: string[];
   maxTokens?: number;
   maxTokensPerPage?: number;
+  perplexityBaseUrl?: string;
+  perplexityModel?: string;
   grokModel?: string;
   grokInlineCitations?: boolean;
   geminiModel?: string;
@@ -1237,13 +1529,15 @@ async function runWebSearch(params: {
   kimiModel?: string;
 }): Promise<Record<string, unknown>> {
   const providerSpecificKey =
-    params.provider === "grok"
-      ? `${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`
-      : params.provider === "gemini"
-        ? (params.geminiModel ?? DEFAULT_GEMINI_MODEL)
-        : params.provider === "kimi"
-          ? `${params.kimiBaseUrl ?? DEFAULT_KIMI_BASE_URL}:${params.kimiModel ?? DEFAULT_KIMI_MODEL}`
-          : "";
+    params.provider === "perplexity"
+      ? `${params.perplexityBaseUrl ?? "direct"}:${params.perplexityModel ?? "perplexity/sonar-pro"}`
+      : params.provider === "grok"
+        ? `${params.grokModel ?? DEFAULT_GROK_MODEL}:${String(params.grokInlineCitations ?? false)}`
+        : params.provider === "gemini"
+          ? (params.geminiModel ?? DEFAULT_GEMINI_MODEL)
+          : params.provider === "kimi"
+            ? `${params.kimiBaseUrl ?? DEFAULT_KIMI_BASE_URL}:${params.kimiModel ?? DEFAULT_KIMI_MODEL}`
+            : "";
   const cacheKey = normalizeCacheKey(
     `${params.provider}:${params.query}:${params.count}:${params.country || "default"}:${params.search_lang || params.language || "default"}:${params.ui_lang || "default"}:${params.freshness || "default"}:${params.dateAfter || "default"}:${params.dateBefore || "default"}:${params.searchDomainFilter?.join(",") || "default"}:${params.maxTokens || "default"}:${params.maxTokensPerPage || "default"}:${providerSpecificKey}`,
   );
@@ -1260,6 +1554,8 @@ async function runWebSearch(params: {
       apiKey: params.apiKey,
       count: params.count,
       timeoutSeconds: params.timeoutSeconds,
+      baseUrl: params.perplexityBaseUrl,
+      model: params.perplexityModel,
       country: params.country,
       searchDomainFilter: params.searchDomainFilter,
       searchRecencyFilter: params.freshness,
@@ -1655,6 +1951,8 @@ export function createWebSearchTool(options?: {
         searchDomainFilter: domainFilter,
         maxTokens: maxTokens ?? undefined,
         maxTokensPerPage: maxTokensPerPage ?? undefined,
+        perplexityBaseUrl: resolvePerplexityBaseUrl(perplexityConfig),
+        perplexityModel: resolvePerplexityModel(perplexityConfig),
         grokModel: resolveGrokModel(grokConfig),
         grokInlineCitations: resolveGrokInlineCitations(grokConfig),
         geminiModel: resolveGeminiModel(geminiConfig),
@@ -1675,6 +1973,9 @@ export const __testing = {
   SEARCH_CACHE,
   FRESHNESS_TO_RECENCY,
   RECENCY_TO_FRESHNESS,
+  resolvePerplexityApiKey,
+  resolvePerplexityBaseUrl,
+  resolvePerplexityModel,
   resolveGrokApiKey,
   resolveGrokModel,
   resolveGrokInlineCitations,

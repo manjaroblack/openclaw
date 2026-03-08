@@ -7,6 +7,9 @@ const {
   normalizeFreshness,
   normalizeToIsoDate,
   isoToPerplexityDate,
+  resolvePerplexityApiKey,
+  resolvePerplexityBaseUrl,
+  resolvePerplexityModel,
   resolveGrokApiKey,
   resolveGrokModel,
   resolveGrokInlineCitations,
@@ -100,6 +103,36 @@ describe("web_search date normalization", () => {
   it("rejects invalid ISO dates", () => {
     expect(isoToPerplexityDate("1/15/2024")).toBeUndefined();
     expect(isoToPerplexityDate("invalid")).toBeUndefined();
+  });
+});
+
+describe("web_search perplexity config resolution", () => {
+  it("uses config apiKey when provided", () => {
+    expect(resolvePerplexityApiKey({ apiKey: "pplx-test-key" })).toEqual({
+      apiKey: "pplx-test-key",
+      source: "config",
+    });
+  });
+
+  it("falls back to OPENROUTER_API_KEY when Perplexity key is absent", () => {
+    withEnv({ PERPLEXITY_API_KEY: undefined, OPENROUTER_API_KEY: "or-test-key" }, () => {
+      expect(resolvePerplexityApiKey({})).toEqual({
+        apiKey: "or-test-key",
+        source: "openrouter_env",
+      });
+    });
+  });
+
+  it("uses configured baseUrl and model when provided", () => {
+    expect(resolvePerplexityBaseUrl({ baseUrl: "https://openrouter.ai/api/v1" })).toBe(
+      "https://openrouter.ai/api/v1",
+    );
+    expect(resolvePerplexityModel({ model: "perplexity/sonar-pro" })).toBe("perplexity/sonar-pro");
+  });
+
+  it("defaults model and leaves baseUrl undefined when omitted", () => {
+    expect(resolvePerplexityBaseUrl({})).toBeUndefined();
+    expect(resolvePerplexityModel({})).toBe("perplexity/sonar-pro");
   });
 });
 

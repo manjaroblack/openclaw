@@ -453,11 +453,11 @@ export type ToolsConfig = {
       cacheTtlMinutes?: number;
       /** Perplexity-specific configuration (used when provider="perplexity"). */
       perplexity?: {
-        /** API key for Perplexity (defaults to PERPLEXITY_API_KEY env var). */
+        /** API key for Perplexity or OpenRouter (defaults to PERPLEXITY_API_KEY or OPENROUTER_API_KEY env var). */
         apiKey?: SecretInput;
-        /** @deprecated Legacy Sonar/OpenRouter field. Ignored by Search API. */
+        /** Base URL override for Perplexity-compatible search. Use https://openrouter.ai/api/v1 for OpenRouter-backed Sonar models. */
         baseUrl?: string;
-        /** @deprecated Legacy Sonar/OpenRouter field. Ignored by Search API. */
+        /** Model override for OpenRouter-backed Perplexity search (default: "perplexity/sonar-pro"). */
         model?: string;
       };
       /** Grok-specific configuration (used when provider="grok"). */

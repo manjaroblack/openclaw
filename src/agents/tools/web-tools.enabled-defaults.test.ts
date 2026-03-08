@@ -15,7 +15,11 @@ function installMockFetch(payload: unknown) {
   return mockFetch;
 }
 
-function createPerplexitySearchTool(perplexityConfig?: { apiKey?: string }) {
+function createPerplexitySearchTool(perplexityConfig?: {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+}) {
   return createWebSearchTool({
     config: {
       tools: {
@@ -87,6 +91,27 @@ function installPerplexitySearchApiFetch(results?: Array<Record<string, unknown>
         url: "https://example.com",
         snippet: "Test snippet",
         date: "2024-01-01",
+      },
+    ],
+  });
+}
+
+function installOpenRouterPerplexityFetch() {
+  return installMockFetch({
+    choices: [
+      {
+        message: {
+          content:
+            '{"results":[{"title":"OpenClaw Release Notes","url":"https://github.com/openclaw/openclaw/releases","description":"Latest OpenClaw release details."}]}',
+          annotations: [
+            {
+              url_citation: {
+                url: "https://github.com/openclaw/openclaw/releases",
+                title: "Releases · openclaw/openclaw",
+              },
+            },
+          ],
+        },
       },
     ],
   });
@@ -314,6 +339,34 @@ describe("web_search perplexity Search API", () => {
       | Record<string, string>
       | undefined;
     expect(headers?.Authorization).toBe("Bearer pplx-config");
+  });
+
+  it("uses OPENROUTER_API_KEY fallback for OpenRouter-backed Perplexity config", async () => {
+    vi.stubEnv("OPENROUTER_API_KEY", "or-test-key");
+    const mockFetch = installOpenRouterPerplexityFetch();
+    const tool = createPerplexitySearchTool({
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "perplexity/sonar-pro",
+    });
+    const result = await tool?.execute?.("call-1", { query: "test" });
+
+    expect(mockFetch).toHaveBeenCalled();
+    expect(mockFetch.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/chat/completions");
+    const headers = (mockFetch.mock.calls[0]?.[1] as RequestInit | undefined)?.headers as
+      | Record<string, string>
+      | undefined;
+    expect(headers?.Authorization).toBe("Bearer or-test-key");
+    const body = parseFirstRequestBody(mockFetch);
+    expect(body.model).toBe("perplexity/sonar-pro");
+    expect(result?.details).toMatchObject({
+      provider: "perplexity",
+      externalContent: { untrusted: true, source: "web_search", wrapped: true },
+      results: expect.arrayContaining([
+        expect.objectContaining({
+          url: "https://github.com/openclaw/openclaw/releases",
+        }),
+      ]),
+    });
   });
 
   it("passes freshness filter to Perplexity Search API", async () => {
