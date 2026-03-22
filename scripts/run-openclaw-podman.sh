@@ -162,6 +162,12 @@ if [[ ! -f "$CONFIG_JSON" ]]; then
   echo "Created $CONFIG_JSON (minimal gateway.mode=local)." >&2
 fi
 
+OPENCLAW_BRANCH="${OPENCLAW_BRANCH:-}"
+if [[ -n "$OPENCLAW_BRANCH" ]]; then
+  export OPENCLAW_BRANCH
+  echo "Using OPENCLAW_BRANCH=$OPENCLAW_BRANCH" >&2
+fi
+
 PODMAN_USERNS="${OPENCLAW_PODMAN_USERNS:-keep-id}"
 USERNS_ARGS=()
 RUN_USER_ARGS=()
